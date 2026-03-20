@@ -108,14 +108,13 @@ class SaveImageWithMetaData:
             },
         }
 
-    # --- CHANGE 1: Specify the output type ---
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "save_images"
     OUTPUT_NODE = True
     DESCRIPTION = "Saves the input images with metadata to your ComfyUI output directory."
     CATEGORY = "SaveImage"
 
-    pattern_format = re.compile(r"(%[^%]+%)") # Pattern to match mask values in the filename
+    pattern_format = re.compile(r"(%[^%]+%)")
 
     def parse_output_format(self, output_format: str):
         fmt = OutputFormat(output_format)
@@ -132,9 +131,6 @@ class SaveImageWithMetaData:
         }.get(quality, 100)
 
     def find_next_available_filename(self, folder: str, name: str, ext: str):
-        """
-        Finds the next available filename by checking existing files in the directory.
-        """
         existing = {f.stem for f in Path(folder).glob(f"{name}_*.{ext}")}
         i = 1
         while f"{name}_{i:05d}" in existing:
@@ -143,7 +139,6 @@ class SaveImageWithMetaData:
 
     @classmethod
     def parse_filename_placeholders(cls, filename: str) -> list[str]:
-        """Extracts placeholder segments like %seed%, %pprompt:32%, etc."""
         return re.findall(cls.pattern_format, filename) if "%" in filename else []
 
     def needs_pnginfo_in_filename(self, segments: list[str]) -> bool:
@@ -153,7 +148,7 @@ class SaveImageWithMetaData:
                 return True
         return False
 
-    def save_images(self, images, filename_prefix="ComfyUI", subdirectory_name="", prompt=None,
+    async def save_images(self, images, filename_prefix="ComfyUI", subdirectory_name="", prompt=None,
                     extra_pnginfo=None, extra_metadata=None, output_format="png",
                     quality="max", metadata_scope="full",
                     include_batch_num=True, prefer_nearest=True, pnginfo_dict=None):
@@ -162,50 +157,74 @@ class SaveImageWithMetaData:
         base_format, save_workflow_json = self.parse_output_format(output_format)
         pnginfo = PngInfo()
 
-        # Parse filename
         filename_prefix = filename_prefix.strip()
         segments = self.parse_filename_placeholders(filename_prefix)
 
-        if metadata_scope in [MetadataScope.FULL, MetadataScope.PARAMETERS_ONLY] or self.needs_pnginfo_in_filename(segments):
-            pnginfo_dict = pnginfo_dict or self.gen_pnginfo(prompt, prefer_nearest)
-
-        filename_prefix = self.format_filename(filename_prefix, pnginfo_dict or {}, segments) + self.prefix_append
-        subdirectory_name = self.format_filename(subdirectory_name, pnginfo_dict or {})
-
-
-        image_shape = images[0].shape
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
-            filename_prefix, self.output_dir, image_shape[1], image_shape[0]
+        needs_metadata = (
+            metadata_scope in [MetadataScope.FULL, MetadataScope.PARAMETERS_ONLY]
+            or self.needs_pnginfo_in_filename(segments)
         )
 
-        # Handle subdirectory naming and creation
+        images_length = len(images)
+        is_list_batch = images_length > 1
+
+        # For single images or when metadata isn't needed, we can resolve once.
+        # For list-batches we defer per-image resolution so each image gets
+        # the prompt string that was actually used to generate it.
+        if needs_metadata and not is_list_batch:
+            # batch_index=0 is always correct for a single image
+            pnginfo_dict = pnginfo_dict or await self.gen_pnginfo(prompt, prefer_nearest, batch_index=0)
+
+        # Use batch_index=0 for filename formatting (consistent across the batch)
+        fmt_pnginfo = pnginfo_dict or (
+            await self.gen_pnginfo(prompt, prefer_nearest, batch_index=0)
+            if needs_metadata else {}
+        )
+
+        filename_prefix_fmt = self.format_filename(filename_prefix, fmt_pnginfo, segments) + self.prefix_append
+        subdirectory_name = self.format_filename(subdirectory_name, fmt_pnginfo)
+
+        image_shape = images[0].shape
+        full_output_folder, filename, counter, subfolder, filename_prefix_fmt = folder_paths.get_save_image_path(
+            filename_prefix_fmt, self.output_dir, image_shape[1], image_shape[0]
+        )
+
         subdirectory_name = subdirectory_name.strip()
         if subdirectory_name:
-            subdirectory_name = self.format_filename(subdirectory_name, pnginfo_dict)
+            subdirectory_name = self.format_filename(subdirectory_name, fmt_pnginfo)
             full_output_folder = os.path.join(self.output_dir, subdirectory_name)
-            filename = filename_prefix
+            filename = filename_prefix_fmt
 
         os.makedirs(full_output_folder, exist_ok=True)
 
         results = list()
-        images_length = len(images)
         last_image_filename = None
 
-        # Process each image
         for batch_number, image in enumerate(images):
             i = 255. * image.cpu().numpy()
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
 
-            # Prepare metadata
-            metadata = self.prepare_pnginfo(pnginfo, pnginfo_dict, batch_number, images_length, prompt, extra_pnginfo, metadata_scope)
+            # ── Per-image metadata resolution for list-batches ───────────────
+            # When multiple images come from a list input, each was generated
+            # with a different prompt string.  We resolve metadata fresh for
+            # each image, passing batch_number so the correct list entry is
+            # selected from the execution cache.
+            if is_list_batch and needs_metadata:
+                current_pnginfo_dict = await self.gen_pnginfo(prompt, prefer_nearest, batch_index=batch_number)
+            else:
+                current_pnginfo_dict = pnginfo_dict
+            # ────────────────────────────────────────────────────────────────
+
+            metadata = self.prepare_pnginfo(
+                pnginfo, current_pnginfo_dict, batch_number, images_length,
+                prompt, extra_pnginfo, metadata_scope
+            )
             for key, value in extra_metadata.items():
                 metadata.add_text(key, value)
 
-            # Handle filename collision and batch number inclusion
             file = f"{filename}_{batch_number:05d}.{base_format}" if include_batch_num else f"{filename}.{base_format}"
             path = os.path.join(full_output_folder, file)
 
-            # Check for filename collision (using next available name)
             if os.path.exists(path):
                 count = self.find_next_available_filename(full_output_folder, filename, base_format)
                 file = f"{filename}_{count:05d}.{base_format}"
@@ -214,7 +233,6 @@ class SaveImageWithMetaData:
             last_image_filename = file
             quality_value = self.get_quality_value(quality)
 
-            # Save image based on format
             if base_format == "webp":
                 img.save(path, "WEBP", lossless=(quality_value == 100), quality=quality_value)
             elif base_format == "png":
@@ -222,32 +240,27 @@ class SaveImageWithMetaData:
             else:
                 img.save(path, optimize=True, quality=quality_value)
 
-            # Insert EXIF for jpg/webp formats
             if base_format in ["jpg", "webp"]:
                 exif_bytes = piexif.dump({
                     "Exif": {
-                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(Capture.gen_parameters_str(pnginfo_dict), encoding="unicode")
+                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                            Capture.gen_parameters_str(current_pnginfo_dict), encoding="unicode"
+                        )
                     }
                 })
                 piexif.insert(exif_bytes, path)
 
             results.append({"filename": file, "subfolder": full_output_folder, "type": self.type})
 
-        # Save workflow metadata for the batch
         if save_workflow_json and images_length > 0 and last_image_filename:
             json_filename = last_image_filename.replace(base_format, "json")
             batch_json_file = os.path.join(full_output_folder, json_filename)
-
             with open(batch_json_file, "w", encoding="utf-8") as f:
                 json.dump(extra_pnginfo["workflow"], f)
-        
-        # --- CHANGE 2: Return the original images along with the UI data ---
+
         return {"ui": {"images": results}, "result": (images,)}
 
     def prepare_pnginfo(self, metadata, pnginfo_dict, batch_number, total_images, prompt, extra_pnginfo, metadata_scope):
-        """
-        Return final PNG metadata with batch information, parameters, and optional prompt details.
-        """
         if metadata_scope == MetadataScope.NONE:
             return None
 
@@ -275,8 +288,8 @@ class SaveImageWithMetaData:
         return metadata
 
     @classmethod
-    def gen_pnginfo(s, prompt, prefer_nearest):
-        inputs = Capture.get_inputs()
+    async def gen_pnginfo(cls, prompt, prefer_nearest, batch_index=0):
+        inputs = await Capture.get_inputs()
         trace_tree_from_this_node = Trace.trace(hook.current_save_image_node_id, prompt)
         inputs_before_this_node = Trace.filter_inputs_by_trace_tree(inputs, trace_tree_from_this_node, prefer_nearest)
 
@@ -287,13 +300,13 @@ class SaveImageWithMetaData:
         else:
             inputs_before_sampler_node = {}
 
-        return Capture.gen_pnginfo_dict(inputs_before_sampler_node, inputs_before_this_node, prompt)
+        return Capture.gen_pnginfo_dict(
+            inputs_before_sampler_node, inputs_before_this_node, prompt,
+            batch_index=batch_index
+        )
 
     @classmethod
     def format_filename(cls, filename, pnginfo_dict, segments=None):
-        """
-        Replaces placeholders in the filename with actual values like date, seed, prompt, etc.
-        """
         if "%" not in filename:
             return filename
 
@@ -327,12 +340,12 @@ class SaveImageWithMetaData:
 
             elif key in {"pprompt", "nprompt"}:
                 prompt_key = "Positive prompt" if key == "pprompt" else "Negative prompt"
-                prompt = pnginfo_dict.get(prompt_key, "")
-                if not prompt:
+                prompt_val = pnginfo_dict.get(prompt_key, "")
+                if not prompt_val:
                     print_warning(f"{prompt_key} not found in pnginfo_dict!")
-                prompt = prompt.replace("\n", " ")
+                prompt_val = prompt_val.replace("\n", " ")
                 length = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-                filename = filename.replace(segment, prompt[:length].strip() if length else prompt.strip())
+                filename = filename.replace(segment, prompt_val[:length].strip() if length else prompt_val.strip())
 
             elif key == "model":
                 model = pnginfo_dict.get("Model", "")
