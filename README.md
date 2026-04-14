@@ -43,7 +43,7 @@ revived_comfyui_image_metadata_extension
 2. Clone this repository:
 
   ```bash
-   git clone https://github.com/Santodan/revived_comfyui_image_metadata_extension.git
+   git clone https://github.com/cyberdeliaAI/revived_comfyui_image_metadata_extension.git
   ```
 
 ## Usage

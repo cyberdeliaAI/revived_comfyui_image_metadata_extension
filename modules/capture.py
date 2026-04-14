@@ -838,24 +838,31 @@ class Capture:
                 print_warning("Steps are empty, full metadata won't be added!")
                 return {}
 
+        # ── Sampler + Schedule type (Forge Neo splits them) ──────────────────
         samplers = inputs_before_sampler_node.get(MetaField.SAMPLER_NAME)
         schedulers = inputs_before_sampler_node.get(MetaField.SCHEDULER)
+        sampler_pretty, schedule_pretty = cls.get_forge_sampler_and_schedule(
+            samplers, schedulers
+        )
+        if sampler_pretty:
+            pnginfo["Sampler"] = sampler_pretty
+        if schedule_pretty:
+            pnginfo["Schedule type"] = schedule_pretty
 
-        if save_civitai_sampler:
-            pnginfo["Sampler"] = cls.get_sampler_for_civitai(samplers, schedulers)
-        elif samplers:
-            sampler_name = samplers[0][1]
-            if schedulers and schedulers[0][1] != "normal":
-                sampler_name += f"_{schedulers[0][1]}"
-            pnginfo["Sampler"] = sampler_name
-
+        # ── CFG scale (format as int when whole) ─────────────────────────────
         extract(MetaField.CFG, "CFG scale")
+        cfg_val = pnginfo.get("CFG scale")
+        if cfg_val is not None:
+            try:
+                f = float(cfg_val)
+                pnginfo["CFG scale"] = str(int(f)) if f.is_integer() else str(f)
+            except (ValueError, TypeError):
+                pass
+
+        # ── Seed ─────────────────────────────────────────────────────────────
         extract(MetaField.SEED, "Seed")
 
-        clip_skip = extract(MetaField.CLIP_SKIP, "Clip skip")
-        if clip_skip is None:
-            pnginfo["Clip skip"] = "1"
-
+        # ── Size (extracted before Model so order matches Forge Neo) ─────────
         image_width_data = inputs_before_sampler_node.get(MetaField.IMAGE_WIDTH, [[None]])
         image_height_data = inputs_before_sampler_node.get(MetaField.IMAGE_HEIGHT, [[None]])
 
@@ -867,11 +874,21 @@ class Capture:
         if width and height:
             pnginfo["Size"] = f"{width}x{height}"
 
-        extract(MetaField.MODEL_NAME, "Model")
+        # ── Model hash BEFORE Model (Forge Neo order) ────────────────────────
         extract(MetaField.MODEL_HASH, "Model hash")
-        extract(MetaField.VAE_NAME, "VAE", inputs_before_this_node)
-        extract(MetaField.VAE_HASH, "VAE hash", inputs_before_this_node)
+        extract(MetaField.MODEL_NAME, "Model")
+        model_name_val = pnginfo.get("Model")
+        if model_name_val:
+            pnginfo["Model"] = os.path.splitext(os.path.basename(model_name_val))[0]
 
+        # ── VAE hash BEFORE VAE, strip extension ─────────────────────────────
+        extract(MetaField.VAE_HASH, "VAE hash", inputs_before_this_node)
+        extract(MetaField.VAE_NAME, "VAE", inputs_before_this_node)
+        vae_name_val = pnginfo.get("VAE")
+        if vae_name_val:
+            pnginfo["VAE"] = os.path.splitext(os.path.basename(vae_name_val))[0]
+
+        # ── Denoising strength ───────────────────────────────────────────────
         denoise = inputs_before_sampler_node.get(MetaField.DENOISE)
         dval = denoise[0][1] if denoise else None
         if dval and 0 < float(dval) < 1:
@@ -880,18 +897,29 @@ class Capture:
         if inputs_before_this_node.get(MetaField.UPSCALE_BY) or inputs_before_this_node.get(MetaField.UPSCALE_MODEL_NAME):
             pnginfo["Denoising strength"] = float(dval or 1.0)
 
+        # ── Clip skip AFTER Denoising strength (Forge Neo order) ─────────────
+        clip_skip = extract(MetaField.CLIP_SKIP, "Clip skip")
+        if clip_skip is None:
+            pnginfo["Clip skip"] = "1"
+
+        # ── Hires fix ────────────────────────────────────────────────────────
         extract(MetaField.UPSCALE_BY, "Hires upscale", inputs_before_this_node)
         extract(MetaField.UPSCALE_MODEL_NAME, "Hires upscaler", inputs_before_this_node)
 
+        # ── LoRAs / embeddings ───────────────────────────────────────────────
         if lora_hashes:
             pnginfo["Lora hashes"] = f'"{lora_hashes}"'
 
         pnginfo.update(cls.gen_loras(inputs_before_sampler_node))
         pnginfo.update(cls.gen_embeddings(inputs_before_sampler_node))
 
-        hashes = cls.get_hashes_for_civitai(inputs_before_sampler_node, inputs_before_this_node)
-        if hashes:
-            pnginfo["Hashes"] = json.dumps(hashes)
+        # ── Version signature (Forge Neo always writes a Version field) ──────
+        pnginfo["Version"] = "ComfyUI"
+
+        # NOTE: The Civitai-style "Hashes: {...}" JSON blob is intentionally
+        # omitted here so the infotext matches Forge Neo byte-for-byte.
+        # Model hash, VAE hash and Lora hashes are still present as individual
+        # fields, which is what Civitai actually parses.
 
         return pnginfo
 
@@ -1150,56 +1178,89 @@ class Capture:
 
         return resource_hashes
 
-    @classmethod
-    def get_sampler_for_civitai(cls, sampler_names, schedulers):
-        """
-        Get the pretty sampler name for Civitai.
-        Reference: https://github.com/civitai/civitai/blob/main/src/server/common/constants.ts
-        """
-        sampler_dict = {
-            'euler': 'Euler',
-            'euler_ancestral': 'Euler a',
-            'heun': 'Heun',
-            'dpm_2': 'DPM2',
-            'dpm_2_ancestral': 'DPM2 a',
-            'lms': 'LMS',
-            'dpm_fast': 'DPM fast',
-            'dpm_adaptive': 'DPM adaptive',
-            'dpmpp_2s_ancestral': 'DPM++ 2S a',
-            'dpmpp_sde': 'DPM++ SDE',
-            'dpmpp_sde_gpu': 'DPM++ SDE',
-            'dpmpp_2m': 'DPM++ 2M',
-            'dpmpp_2m_sde': 'DPM++ 2M SDE',
-            'dpmpp_2m_sde_gpu': 'DPM++ 2M SDE',
-            'ddim': 'DDIM',
-            'plms': 'PLMS',
-            'uni_pc': 'UniPC',
-            'uni_pc_bh2': 'UniPC',
-            'lcm': 'LCM'
-        }
+    # Pretty display names for ComfyUI scheduler enum values,
+    # matching the "Schedule type" dropdown shown in Forge / Forge Neo.
+    SCHEDULER_PRETTY = {
+        "normal": "Normal",
+        "karras": "Karras",
+        "exponential": "Exponential",
+        "sgm_uniform": "SGM Uniform",
+        "simple": "Simple",
+        "ddim_uniform": "DDIM",
+        "beta": "Beta",
+        "linear_quadratic": "Linear Quadratic",
+        "kl_optimal": "KL Optimal",
+        "polyexponential": "Polyexponential",
+    }
 
+    # Pretty display names for samplers (Civitai / A1111 naming).
+    SAMPLER_PRETTY = {
+        'euler': 'Euler',
+        'euler_ancestral': 'Euler a',
+        'heun': 'Heun',
+        'dpm_2': 'DPM2',
+        'dpm_2_ancestral': 'DPM2 a',
+        'lms': 'LMS',
+        'dpm_fast': 'DPM fast',
+        'dpm_adaptive': 'DPM adaptive',
+        'dpmpp_2s_ancestral': 'DPM++ 2S a',
+        'dpmpp_sde': 'DPM++ SDE',
+        'dpmpp_sde_gpu': 'DPM++ SDE',
+        'dpmpp_2m': 'DPM++ 2M',
+        'dpmpp_2m_sde': 'DPM++ 2M SDE',
+        'dpmpp_2m_sde_gpu': 'DPM++ 2M SDE',
+        'dpmpp_3m_sde': 'DPM++ 3M SDE',
+        'dpmpp_3m_sde_gpu': 'DPM++ 3M SDE',
+        'ddim': 'DDIM',
+        'plms': 'PLMS',
+        'uni_pc': 'UniPC',
+        'uni_pc_bh2': 'UniPC',
+        'lcm': 'LCM',
+    }
+
+    @classmethod
+    def _pretty_scheduler(cls, scheduler):
+        if not scheduler:
+            return None
+        if scheduler in cls.SCHEDULER_PRETTY:
+            return cls.SCHEDULER_PRETTY[scheduler]
+        # Fallback: turn snake_case into Title Case ("some_thing" -> "Some Thing")
+        return " ".join(part.capitalize() for part in str(scheduler).split("_"))
+
+    @classmethod
+    def _pretty_sampler(cls, sampler):
+        if not sampler:
+            return None
+        return cls.SAMPLER_PRETTY.get(sampler, sampler)
+
+    @classmethod
+    def get_forge_sampler_and_schedule(cls, sampler_names, schedulers):
+        """
+        Return (sampler_pretty, schedule_type_pretty) as two separate strings,
+        matching Forge / Forge Neo's infotext format where Sampler and
+        "Schedule type" are distinct fields.
+        """
         sampler = None
         scheduler = None
-
         if sampler_names and len(sampler_names) > 0:
             sampler = sampler_names[0][1]
         if schedulers and len(schedulers) > 0:
             scheduler = schedulers[0][1]
+        return cls._pretty_sampler(sampler), cls._pretty_scheduler(scheduler)
 
-        def get_scheduler_name(sampler_name, scheduler):
-            if scheduler == "karras":
-                return f"{sampler_name} Karras"
-            elif scheduler == "exponential":
-                return f"{sampler_name} Exponential"
-            elif scheduler == "normal":
-                return sampler_name
-            else:
-                return f"{sampler_name}_{scheduler}"
-
-        if not sampler:
+    @classmethod
+    def get_sampler_for_civitai(cls, sampler_names, schedulers):
+        """
+        Legacy combined sampler name (sampler + scheduler merged), kept for
+        backward compatibility with any caller that still expects it.
+        """
+        sampler_pretty, schedule_pretty = cls.get_forge_sampler_and_schedule(
+            sampler_names, schedulers
+        )
+        if not sampler_pretty:
             return None
-
-        if sampler in sampler_dict:
-            return get_scheduler_name(sampler_dict[sampler], scheduler)
-
-        return get_scheduler_name(sampler, scheduler)
+        if not schedule_pretty or schedule_pretty == "Normal":
+            return sampler_pretty
+        if schedule_pretty in ("Karras", "Exponential"):
+            return f"{sampler_pretty} {schedule_pretty}"
+        return f"{sampler_pretty}_{schedule_pretty.lower().replace(' ', '_')}"
