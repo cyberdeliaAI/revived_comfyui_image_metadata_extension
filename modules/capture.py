@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -29,8 +30,9 @@ class OutputCacheCompat:
 
 # ---------------------------------------------------------------------------
 # Runtime-resolved node text store.
-# Populated by Capture.get_inputs() after awaiting get_input_data() per node.
-# Keyed by node_id (str) -> resolved text (str).
+# Populated by Capture.get_inputs() after awaiting get_input_data() per node,
+# and seeded from hook.current_resolved_texts (CLIPTextEncode wrapper).
+# Keyed by node_id (str) -> resolved text (str or list[str]).
 # This is the only reliable source for wildcard-expanded / dynamic text.
 # ---------------------------------------------------------------------------
 _resolved_node_texts: dict = {}
@@ -38,6 +40,52 @@ _resolved_node_texts: dict = {}
 
 def _clear_resolved_texts():
     _resolved_node_texts.clear()
+    _resolved_node_texts.update(getattr(hook, "current_resolved_texts", {}))
+
+
+def _coerce_text_value(value, batch_index=0):
+    """Normalize a text value to a plain string, handling lists/tuples."""
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, (list, tuple)):
+        text_items = [item for item in value if isinstance(item, str) and item.strip()]
+        if not text_items:
+            return None
+        idx = min(batch_index, len(text_items) - 1)
+        return text_items[idx]
+    return None
+
+
+_UNRESOLVED_PROMPT_PATTERNS = (
+    re.compile(r"__[\w./\\-]+__"),       # wildcard placeholders
+    re.compile(r"\{\d+\$\$"),            # dynamic prompt syntax
+)
+
+
+def _looks_unresolved_prompt_text(value):
+    """Return True when *value* still contains wildcard / dynamic prompt syntax."""
+    text = _coerce_text_value(value)
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _UNRESOLVED_PROMPT_PATTERNS)
+
+
+def _should_prefer_graph_prompt(current_value, graph_value):
+    """Return True when the graph-resolved text should replace current_value."""
+    current_text = _coerce_text_value(current_value)
+    graph_text = _coerce_text_value(graph_value)
+    if not graph_text:
+        return False
+    if not current_text or _is_link(current_value):
+        return True
+    if current_text == graph_text:
+        return False
+    return _looks_unresolved_prompt_text(current_text) and not _looks_unresolved_prompt_text(graph_text)
+
+
+def _needs_graph_prompt_resolution(value):
+    """Return True when *value* needs to be (re-)resolved from the graph."""
+    return not _coerce_text_value(value) or _is_link(value) or _looks_unresolved_prompt_text(value)
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +179,11 @@ def _resolve_text_from_graph(value, prompt, outputs, _visited=None, batch_index=
     # ── 1. Runtime interception cache (populated by HierarchicalCache.set patch) ────────
     # Check slot-specific key first, then plain node_id key.
     slot_key = f"{node_id}:{out_slot}"
-    cached_text = _resolved_node_texts.get(slot_key) or _resolved_node_texts.get(node_id)
-    if cached_text and isinstance(cached_text, str) and cached_text.strip():
+    cached_text = _coerce_text_value(
+        _resolved_node_texts.get(slot_key) or _resolved_node_texts.get(node_id),
+        batch_index=batch_index,
+    )
+    if cached_text:
         return cached_text
 
     # ── 2. Walk the graph node ───────────────────────────────────────────────
@@ -230,7 +281,7 @@ def _resolve_clip_text_encode_prompt(node_id, prompt, outputs, batch_index=0):
     # ── 1. Runtime-resolved text (populated by await get_input_data) ─────────
     # This is the only reliable source when "text" is wired from a dynamic
     # node (WildcardManager, StringConcatenate, etc.).
-    cached_text = _resolved_node_texts.get(nid)
+    cached_text = _coerce_text_value(_resolved_node_texts.get(nid), batch_index=batch_index)
     if cached_text:
         return cached_text
 
@@ -536,9 +587,7 @@ class Capture:
                         if not isinstance(_entry_outputs, (list, tuple)):
                             continue
                         for _si, _sv in enumerate(_entry_outputs):
-                            if isinstance(_sv, list) and len(_sv) == 1:
-                                _sv = _sv[0]
-                            if isinstance(_sv, str) and _sv.strip():
+                            if _coerce_text_value(_sv) is not None:
                                 _resolved_node_texts[f"{_nid}:{_si}"] = _sv
                                 if str(_nid) not in _resolved_node_texts:
                                     _resolved_node_texts[str(_nid)] = _sv
@@ -570,7 +619,7 @@ class Capture:
                             node_inputs, obj_class, node_id, _exec_arg,
                             DynamicPrompt(prompt), extra_data
                         )
-                        if asyncio.iscoroutine(input_data) or hasattr(input_data, "__await__"):
+                        if inspect.isawaitable(input_data):
                             input_data = await input_data
                         # Check if we got a real resolved value for linked inputs
                         _dbg = input_data[0] if isinstance(input_data, (list,tuple)) and input_data else {}
@@ -635,9 +684,7 @@ class Capture:
                         if not isinstance(_entry_outputs, (list, tuple)):
                             continue
                         for _si, _sv in enumerate(_entry_outputs):
-                            if isinstance(_sv, list) and len(_sv) == 1:
-                                _sv = _sv[0]
-                            if isinstance(_sv, str) and _sv.strip():
+                            if _coerce_text_value(_sv) is not None:
                                 _resolved_node_texts[f"{_entry_nid}:{_si}"] = _sv
                                 if _entry_nid not in _resolved_node_texts:
                                     _resolved_node_texts[_entry_nid] = _sv
@@ -649,10 +696,8 @@ class Capture:
                 _rd = input_data[0] if isinstance(input_data[0], dict) else {}
                 for _tkey in ("text", "string", "value", "prompt",
                               "positive_prompt", "negative_prompt"):
-                    _tv = _rd.get(_tkey)
-                    if isinstance(_tv, list) and _tv:
-                        _tv = _tv[0]
-                    if isinstance(_tv, str) and _tv.strip():
+                    _tv = _coerce_text_value(_rd.get(_tkey))
+                    if _tv:
                         if _rid not in _resolved_node_texts:
                             _resolved_node_texts[_rid] = _tv
                         break
@@ -812,13 +857,14 @@ class Capture:
         if neg_list:
             current_negative = neg_list[0][1] if len(neg_list[0]) > 1 else None
 
-        # If either prompt is missing or is just a link reference, re-resolve
-        if (not current_positive or _is_link(current_positive) or
-                not current_negative or _is_link(current_negative)):
+        # If either prompt is missing, linked, or still contains unresolved
+        # wildcard syntax, re-resolve from the active sampler/conditioning path.
+        if (_needs_graph_prompt_resolution(current_positive) or
+            _needs_graph_prompt_resolution(current_negative)):
             graph_pos, graph_neg = _find_prompt_texts(prompt, outputs, batch_index=batch_index)
-            if graph_pos and (not current_positive or _is_link(current_positive)):
+            if graph_pos and _should_prefer_graph_prompt(current_positive, graph_pos):
                 inputs_before_sampler_node[MetaField.POSITIVE_PROMPT] = [("graph", graph_pos)]
-            if graph_neg and (not current_negative or _is_link(current_negative)):
+            if graph_neg and _should_prefer_graph_prompt(current_negative, graph_neg):
                 inputs_before_sampler_node[MetaField.NEGATIVE_PROMPT] = [("graph", graph_neg)]
         # ─────────────────────────────────────────────────────────────────────
 
