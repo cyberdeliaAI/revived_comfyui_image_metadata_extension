@@ -32,6 +32,10 @@ CAPTURE_FIELD_LIST = {
         MetaField.MODEL_NAME: {"field_name": "ckpt_name"},
         MetaField.MODEL_HASH: {"field_name": "ckpt_name", "format": calc_model_hash},
     },
+    "Checkpoint Loader with Name (Image Saver)": {
+        MetaField.MODEL_NAME: {"field_name": "ckpt_name"},
+        MetaField.MODEL_HASH: {"field_name": "ckpt_name", "format": calc_model_hash},
+    },
     "CLIPSetLastLayer": {
         MetaField.CLIP_SKIP: {
             "field_name": "stop_at_clip_layer",
