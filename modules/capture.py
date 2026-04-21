@@ -287,6 +287,50 @@ def _follow_conditioning_to_clip_text(cond_value, prompt, outputs, _depth=0, bat
             if resolved:
                 return resolved
 
+    # ── Conditioning pass-through nodes (Context Big, ControlNetApply, …) ──
+    # These nodes route conditioning through without changing it.  We use the
+    # *output slot* we arrived from to pick the matching input ("positive" or
+    # "negative") so positive/negative chains stay separate.
+    #
+    # Known output-slot → input-key mappings per node class:
+    _COND_PASSTHROUGH_SLOT_MAP = {
+        # Context Big (rgthree) – slot 4 = positive, slot 5 = negative
+        "Context Big (rgthree)":        {4: "positive", 5: "negative"},
+        "Context (rgthree)":            {4: "positive", 5: "negative"},
+        # ControlNetApplyAdvanced – slot 0 = positive, slot 1 = negative
+        "ControlNetApplyAdvanced":      {0: "positive", 1: "negative"},
+        "ControlNetApply":              {0: "positive", 1: "negative"},
+    }
+
+    out_slot = cond_value[1] if len(cond_value) > 1 else 0
+    slot_map = _COND_PASSTHROUGH_SLOT_MAP.get(src_class)
+    if slot_map is not None:
+        follow_key = slot_map.get(out_slot)
+        if follow_key and follow_key in src_inputs and _is_link(src_inputs[follow_key]):
+            result = _follow_conditioning_to_clip_text(
+                src_inputs[follow_key], prompt, outputs, _depth + 1, batch_index
+            )
+            if result:
+                return result
+    elif "positive" in src_inputs and "negative" in src_inputs:
+        # Generic fallback for unknown pass-through nodes that have both
+        # positive and negative inputs: try to match by ordered input position.
+        # Build a list of input keys in definition order and find which slot
+        # corresponds to "positive" vs "negative".
+        ordered_keys = list(src_inputs.keys())
+        cond_positions = {}
+        for idx, k in enumerate(ordered_keys):
+            if k in ("positive", "negative"):
+                cond_positions[idx] = k
+        # If the output slot matches a conditioning position, follow it.
+        follow_key = cond_positions.get(out_slot)
+        if follow_key and _is_link(src_inputs[follow_key]):
+            result = _follow_conditioning_to_clip_text(
+                src_inputs[follow_key], prompt, outputs, _depth + 1, batch_index
+            )
+            if result:
+                return result
+
     # ── Conditioning passthrough: follow the *first* conditioning input ──
     PASSTHROUGH_KEYS = ("conditioning", "cond", "conditioning_1", "conditioning_2")
     for k in PASSTHROUGH_KEYS:

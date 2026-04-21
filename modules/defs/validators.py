@@ -56,6 +56,15 @@ PASSTHROUGH_SLOT_TO_INPUT = {
         5: "negative",
         6: "latent",
     },
+    # ControlNet nodes pass conditioning through: output 0 = positive, 1 = negative
+    "ControlNetApplyAdvanced": {
+        0: "positive",
+        1: "negative",
+    },
+    "ControlNetApply": {
+        0: "positive",
+        1: "negative",
+    },
 }
 
 
