@@ -131,6 +131,9 @@ CAPTURE_FIELD_LIST = {
     "RandomNoise": {
         MetaField.SEED: {"field_name": "noise_seed"},
     },
+    "Seed (rgthree)": {
+        MetaField.SEED: {"field_name": "seed"},
+    },
     "BasicScheduler": {
         MetaField.STEPS: {"field_name": "steps"},
         MetaField.SCHEDULER: {"field_name": "scheduler"},

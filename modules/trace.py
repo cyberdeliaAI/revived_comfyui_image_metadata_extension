@@ -98,9 +98,21 @@ class Trace:
 
     @classmethod
     def find_sampler_node_id(cls, trace_tree):
-        node = cls.find_node_by_class_types(trace_tree, set(SAMPLERS.keys()))
-        if node:
-            return node
+        """Find the primary sampler node in the trace tree.
+
+        When multiple samplers exist (e.g. 1st pass + upscale pass), the
+        farthest one from the save node is the primary generation sampler
+        whose settings (steps, cfg, seed, sampler) should be reported.
+        """
+        sampler_classes = set(SAMPLERS.keys())
+        best_nid = None
+        best_dist = -1
+        for nid, (dist, class_type) in trace_tree.items():
+            if class_type in sampler_classes and dist > best_dist:
+                best_nid = nid
+                best_dist = dist
+        if best_nid:
+            return best_nid
         print_warning("Could not find a sampler node in the trace tree!")
 
     @classmethod

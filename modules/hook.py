@@ -43,6 +43,11 @@ def pre_execute(self, prompt, prompt_id, extra_data, execute_outputs):
     prompt_executer = self
     current_resolved_texts = {}
 
+    # Clear the trace cache so stale data from a previous generation
+    # (different workflow / different prompt) doesn't leak through.
+    from .trace import Trace
+    Trace._trace_cache.clear()
+
 
 def pre_get_input_data(inputs, class_def, unique_id, *args):
     global current_save_image_node_id

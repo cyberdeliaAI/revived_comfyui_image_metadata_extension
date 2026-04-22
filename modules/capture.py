@@ -909,21 +909,54 @@ class Capture:
             # Fallback: read critical sampler fields directly from the prompt graph.
             # This handles the case where Trace found the sampler but CAPTURE_FIELD_LIST
             # didn't capture the fields (e.g. second run, async timing issue).
+            # Prefer the sampler with denoise=1.0 (generation pass) over any
+            # upscale/hires sampler with denoise < 1.0.
+            _sampler_candidates = []
             for _nid, _node in prompt.items():
                 _ni = _node.get("inputs", {})
                 if "steps" in _ni and "sampler_name" in _ni and "cfg" in _ni:
                     if isinstance(_ni.get("steps"), (int, float)):
-                        inputs_before_sampler_node[MetaField.STEPS] = [(_nid, _ni["steps"])]
-                        if not inputs_before_sampler_node.get(MetaField.SAMPLER_NAME):
-                            inputs_before_sampler_node[MetaField.SAMPLER_NAME] = [(_nid, _ni["sampler_name"])]
-                        if not inputs_before_sampler_node.get(MetaField.SCHEDULER):
-                            inputs_before_sampler_node[MetaField.SCHEDULER] = [(_nid, _ni.get("scheduler", "normal"))]
-                        if not inputs_before_sampler_node.get(MetaField.CFG):
-                            inputs_before_sampler_node[MetaField.CFG] = [(_nid, _ni["cfg"])]
-                        _seed = _ni.get("seed")
-                        if not inputs_before_sampler_node.get(MetaField.SEED) and not _is_link(_seed):
-                            inputs_before_sampler_node[MetaField.SEED] = [(_nid, _seed)]
-                        break
+                        _denoise = _ni.get("denoise", 1.0)
+                        if isinstance(_denoise, (int, float)):
+                            _sampler_candidates.append((_nid, _ni, _denoise))
+            # Sort: denoise=1.0 first (primary gen), then by steps descending
+            _sampler_candidates.sort(
+                key=lambda x: (-x[2] if x[2] >= 1.0 else x[2], -x[1].get("steps", 0))
+            )
+            if _sampler_candidates:
+                _nid, _ni, _ = _sampler_candidates[0]
+                inputs_before_sampler_node[MetaField.STEPS] = [(_nid, _ni["steps"])]
+                if not inputs_before_sampler_node.get(MetaField.SAMPLER_NAME):
+                    inputs_before_sampler_node[MetaField.SAMPLER_NAME] = [(_nid, _ni["sampler_name"])]
+                if not inputs_before_sampler_node.get(MetaField.SCHEDULER):
+                    inputs_before_sampler_node[MetaField.SCHEDULER] = [(_nid, _ni.get("scheduler", "normal"))]
+                if not inputs_before_sampler_node.get(MetaField.CFG):
+                    inputs_before_sampler_node[MetaField.CFG] = [(_nid, _ni["cfg"])]
+                _seed = _ni.get("seed")
+                if not inputs_before_sampler_node.get(MetaField.SEED):
+                    if not _is_link(_seed):
+                        inputs_before_sampler_node[MetaField.SEED] = [(_nid, _seed)]
+                    else:
+                        # Follow seed link chain to resolve actual value
+                        _cur = _seed
+                        _visited_seed = set()
+                        while _is_link(_cur) and str(_cur[0]) not in _visited_seed:
+                            _visited_seed.add(str(_cur[0]))
+                            _src = prompt.get(str(_cur[0]))
+                            if _src is None:
+                                break
+                            _si = _src.get("inputs", {})
+                            for _sk in ("seed", "noise_seed", "value"):
+                                _sv = _si.get(_sk)
+                                if isinstance(_sv, (int, float)):
+                                    inputs_before_sampler_node[MetaField.SEED] = [(_nid, int(_sv))]
+                                    _cur = None
+                                    break
+                                elif _is_link(_sv):
+                                    _cur = _sv
+                                    break
+                            else:
+                                break
             if not extract(MetaField.STEPS, "Steps"):
                 print_warning("Steps are empty, full metadata won't be added!")
                 return {}
@@ -951,6 +984,49 @@ class Capture:
 
         # ── Seed ─────────────────────────────────────────────────────────────
         extract(MetaField.SEED, "Seed")
+
+        # If seed is still missing, resolve it by following links through the graph
+        if "Seed" not in pnginfo:
+            _seed_resolved = None
+            # Find the primary KSampler and follow its seed link
+            for _nid, _node in prompt.items():
+                _ni = _node.get("inputs", {})
+                if _node.get("class_type") == "KSampler" and "steps" in _ni:
+                    _seed_val = _ni.get("seed")
+                    if isinstance(_seed_val, (int, float)):
+                        _denoise = _ni.get("denoise", 1.0)
+                        if isinstance(_denoise, (int, float)) and _denoise >= 1.0:
+                            _seed_resolved = int(_seed_val)
+                            break
+                    elif _is_link(_seed_val):
+                        # Follow the link chain to find the actual seed value
+                        _visited_seed = set()
+                        _cur = _seed_val
+                        while _is_link(_cur) and str(_cur[0]) not in _visited_seed:
+                            _visited_seed.add(str(_cur[0]))
+                            _src_node = prompt.get(str(_cur[0]))
+                            if _src_node is None:
+                                break
+                            _src_inputs = _src_node.get("inputs", {})
+                            # Check for direct seed value on this node
+                            for _sk in ("seed", "noise_seed", "value"):
+                                _sv = _src_inputs.get(_sk)
+                                if isinstance(_sv, (int, float)):
+                                    _seed_resolved = int(_sv)
+                                    break
+                                elif _is_link(_sv):
+                                    _cur = _sv
+                                    break
+                            else:
+                                break
+                            if _seed_resolved is not None:
+                                break
+                    if _seed_resolved is not None:
+                        _denoise = _ni.get("denoise", 1.0)
+                        if isinstance(_denoise, (int, float)) and _denoise >= 1.0:
+                            break
+            if _seed_resolved is not None:
+                pnginfo["Seed"] = str(_seed_resolved)
 
         # ── Size (extracted before Model so order matches Forge Neo) ─────────
         image_width_data = inputs_before_sampler_node.get(MetaField.IMAGE_WIDTH, [[None]])
