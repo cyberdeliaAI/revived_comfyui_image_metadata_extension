@@ -1,3 +1,8 @@
+> **⚠️ This repository is no longer maintained.**
+  > Development continues at [comfyui-cyberdelia-metadata](https://github.com/cyberdeliaAI/comfyui-cyberdelia-metadata) under the Cyberdelia AI Lab umbrella. Please install the new repo for the latest version and bugfixes.
+
+  
+
 # ComfyUI Image Metadata Extension
 
 ![node-preview](assets/preview.PNG)
